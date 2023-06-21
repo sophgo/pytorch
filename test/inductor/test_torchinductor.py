@@ -5420,7 +5420,7 @@ class CommonTemplate:
         r2, (fw_code, bw_code) = run_fw_bw_and_get_code(lambda: run(ones))
         if self.device == "cuda":
             self.assertEqual(fw_code.count("tl.rand"), 1)
-            self.assertEqual(bw_code.count("tl.rand"), 0)
+            self.assertEqual(bw_code.count("tl.rand"), 1)
         g2 = weight.grad.clone()
         check(r2, g2)
 
@@ -5455,8 +5455,13 @@ class CommonTemplate:
         )
         if self.device == "cuda":
             self.assertEqual(fw_code.count("tl.rand"), 1)
-            self.assertEqual(bw_code.count("tl.rand"), 0)
-            expected_kernel = 4
+            self.assertEqual(bw_code.count("tl.rand"), 2)
+
+            # seed generation
+            self.assertEqual(fw_code.count("aten.randint.low_out"), 1)
+            self.assertEqual(bw_code.count("aten.randint.low_out"), 0)
+
+            expected_kernel = 6
         else:
             expected_kernel = 6
 

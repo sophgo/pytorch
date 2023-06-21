@@ -2,9 +2,11 @@
 import itertools
 
 import torch
+
 from torch._dynamo.test_case import run_tests, TestCase
 from torch._dynamo.testing import expectedFailureDynamicWrapper
 from torch._dynamo.utils import counters
+from torch._inductor import config
 from torch._inductor.utils import run_and_get_code
 from torch.nn import functional as F
 from torch.testing._internal.common_utils import IS_LINUX, TEST_WITH_ROCM
@@ -67,7 +69,18 @@ binary_list = {
     lambda x, y: x.sub_(y): 2,  # call_method
 }
 
+linear_binary_list = {
+    lambda x, y: torch.add(x, y): (2, 4, False),  # call_function
+    lambda x, y: torch.add(y, x): (1, 2, False),  # call_function
+    lambda x, y: x.add(y): (2, 4, False),  # call_method
+    lambda x, y: x.add_(y): (2, 4, True),  # call_method
+    lambda x, y: torch.sub(x, y): (1, 2, False),  # call_function
+    lambda x, y: x.sub(y): (1, 2, False),  # call_method
+    lambda x, y: x.sub_(y): (1, 2, True),  # call_method
+}
 
+
+@config.patch({"freezing": True})
 class TestPaternMatcher(TestCase):
     def _clone_inputs(self, inputs):
         def clone(x):
@@ -271,19 +284,28 @@ class TestPaternMatcher(TestCase):
 
             def forward(self, x, y):
                 x = self.linear(x)
-                x = self.binary_fn(x, y)
+                x = self.binary_fn(x, y.clone())
                 return x
 
-        options = itertools.product(binary_list, [[2, 3, 10], [2, 10]], [True, False])
+        options = itertools.product(
+            linear_binary_list, [[2, 3, 10], [2, 10]], [True, False]
+        )
         dtype = torch.bfloat16
         out_feature = 30
         if torch.ops.mkldnn._is_mkldnn_bf16_supported():
             for binary_fn, input_shape, bias in options:
+                match_count = linear_binary_list[binary_fn][0]
+                match_nodes = linear_binary_list[binary_fn][1]
+                if len(input_shape) == 3:
+                    is_inplace = linear_binary_list[binary_fn][2]
+                    # view + linear + view(joint_graph+post_grad)
+                    match_count = match_count + 5 if is_inplace else match_count + 3
+                    match_nodes = match_nodes + 7 if is_inplace else match_nodes + 5
                 mod = M(binary_fn, input_shape[-1], out_feature, bias).to(dtype).eval()
                 v = torch.randn(input_shape).to(dtype)
                 other = torch.randn(input_shape[:-1] + [out_feature]).to(dtype)
                 self._test_common(
-                    mod, (v, other), 1, binary_list[binary_fn], rtol=1e-2, atol=1e-2
+                    mod, (v, other), match_count, match_nodes, rtol=1e-2, atol=1e-2
                 )
 
     # https://github.com/pytorch/pytorch/issues/99841.
@@ -304,9 +326,9 @@ class TestPaternMatcher(TestCase):
         # check works for min_value > max_value.
         min_values = [3, torch.randn(1, 32, 28, 28)]
         max_values = [0, torch.randn(1, 32, 28, 28)]
-        mod = Model().eval()
         v = torch.randn(1, 3, 28, 28)
         for min_value, max_value in zip(min_values, max_values):
+            mod = Model().eval()
             self._test_common(mod, (v, min_value, max_value), 1, 3)
 
     def test_leaky_relu_pattern_fallback(self):
@@ -323,9 +345,9 @@ class TestPaternMatcher(TestCase):
 
         negative_slopes = [0.1, torch.randn(1, 32, 28, 28)]
         with torch.no_grad():
-            mod = Model().eval()
             v = torch.randn(1, 3, 28, 28)
             for negative_slope in negative_slopes:
+                mod = Model().eval()
                 self._test_common(mod, (v, negative_slope), 1, 4)
 
     # https://github.com/pytorch/pytorch/issues/99838.
@@ -471,8 +493,8 @@ class TestPaternMatcher(TestCase):
         ]
 
         # case1
-        mod = Model().to(memory_format=torch.channels_last).eval()
         for other, alpha in zip(others, [0.1, 1.0]):
+            mod = Model().to(memory_format=torch.channels_last).eval()
             self._test_code_common(mod, (input, other, alpha), include_ops, exclude_ops)
         # case2:
         mod = Model2().to(memory_format=torch.channels_last).eval()

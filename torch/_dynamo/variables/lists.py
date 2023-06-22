@@ -1,3 +1,4 @@
+import builtins
 import collections
 import functools
 import inspect
@@ -26,6 +27,7 @@ class BaseListVariable(VariableTracker):
             slice: SliceVariable,
             torch.Size: SizeVariable,
             tuple: TupleVariable,
+            set: SetVariable,
         }[obj]
 
     def __init__(
@@ -659,3 +661,117 @@ class ListIteratorVariable(VariableTracker):
 
 class TupleIteratorVariable(ListIteratorVariable):
     pass
+
+
+class SetVariable(VariableTracker):
+    def __init__(
+        self,
+        tx,
+        items: List[VariableTracker],
+        recursively_contains=None,
+        regen_guards=True,
+        **kwargs,
+    ):
+        underlying_items = kwargs.pop("_underlying_items", set())
+        super().__init__(recursively_contains=recursively_contains, **kwargs)
+        # Note - Set is still backed by a list, because we want set behavior over the contents,
+        assert isinstance(items, list)
+        assert all(isinstance(x, VariableTracker) for x in items)
+
+        # Sometimes, we know that we have passed in the guards from the items in the set
+        if regen_guards:
+            self.guards.update(VariableTracker.propagate(items)["guards"])
+
+        self.items = []
+        self._underlying_items = underlying_items
+        if underlying_items:
+            self.items = items
+        else:
+            self._add(tx, items)
+
+        # Really annoying to store this here - but required because of how
+        # VariableTracker's clone works w/r/t attr setting from dict
+        self.tx = tx
+
+    def as_proxy(self):
+        return [x.as_proxy() for x in self.items]
+
+    def python_type(self):
+        return set
+
+    def reconstruct(self, codegen):
+        codegen.create_load_python_module(builtins, True)
+        codegen.create_load_global("set", False)
+        codegen.foreach(self.items)
+        return [create_instruction("BUILD_SET", arg=len(self.items))]
+
+    # Note - this is only used for producing a set
+    def _get_underlying_value(self, tx, vt):
+        from .base import VariableTracker
+        from .tensor import TensorVariable
+
+        assert isinstance(vt, VariableTracker)
+
+        if isinstance(vt, TensorVariable):
+            if not vt.source:
+                unimplemented("Sets with non input tensors NYI")
+            scope = {"L": tx.output.local_scope, "G": tx.output.global_scope}
+            real_tensor = eval(vt.source.name(), scope)
+            return real_tensor
+        if isinstance(vt, ConstantVariable):
+            return vt.value
+
+        unimplemented(f"Sets with {type(vt)} NYI")
+
+    def _add(self, tx, item):
+        if isinstance(item, (list, set)):
+            for i in item:
+                self._add(tx, i)
+            return self.items
+
+        ev = self._get_underlying_value(tx, item)
+        if ev not in self._underlying_items:
+            self._underlying_items.add(ev)
+            self.items.append(item)
+        return self.items
+
+    def call_method(
+        self,
+        tx,
+        name,
+        args: List[VariableTracker],
+        kwargs: Dict[str, VariableTracker],
+    ) -> "VariableTracker":
+        options = VariableTracker.propagate(self, args, kwargs.values())
+        # Somewhat duplicative of CommonListMethodsVariable - but better than to violate substitution
+        # principles and end up with things like direct item access attempts on a set, or
+        # getitem sources.
+        if name == "add" and args and self.mutable_local:
+            assert not kwargs
+            item = args[0]
+            result = SetVariable(
+                tx,
+                self._add(tx, item),
+                mutable_local=self.mutable_local,
+                regen_guards=False,
+                **options,
+            )
+            tx.replace_all(self, result)
+            return ConstantVariable(None)
+        elif name == "pop" and self.mutable_local:
+            assert not kwargs
+            assert not args
+            items = list(self.items)
+            result = items.pop()
+            tx.replace_all(
+                self,
+                SetVariable(tx, items, regen_guards=False, **options),
+            )
+            return result
+        elif name == "__len__":
+            return ConstantVariable(len(self.items))
+        else:
+            return super().call_method(tx, name, args, kwargs)
+
+    def getitem_const(self, arg: VariableTracker):
+        raise RuntimeError("Illegal to getitem on a set")

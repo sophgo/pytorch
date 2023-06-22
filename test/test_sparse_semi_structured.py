@@ -3,6 +3,7 @@ import random
 import unittest
 
 import torch
+import unittest
 from torch import nn
 
 from torch.sparse.semi_structured import (

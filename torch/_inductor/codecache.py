@@ -113,6 +113,9 @@ class CacheBase:
                 "cuda": torch.version.cuda,
                 "triton": triton_version,
             },
+            "other": {
+                "allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+            },
         }
 
         system["hash"] = hashlib.sha256(

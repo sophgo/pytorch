@@ -989,6 +989,7 @@ class VariableBuilder:
                         constraint_dim=None,
                     ),
                     hint=value,
+                    source=self.source,
                 )
                 self.tx.output.tracked_fakes.append(
                     TrackedFake(wrapped_value, self.source, None)

@@ -2,17 +2,9 @@
 
 from __future__ import annotations
 
-import warnings
-from typing import (
-    Callable,
-    Collection,
-    Dict,
-    Generic,
-    Optional,
-    Set,
-    TYPE_CHECKING,
-    TypeVar,
-)
+import dataclasses
+from collections import defaultdict
+from typing import Dict, Optional, Set, TYPE_CHECKING, Union
 
 from torch.onnx._internal import _beartype
 
@@ -20,159 +12,52 @@ from torch.onnx._internal import _beartype
 # 'import torch.onnx' continues to work without having 'onnx' installed. We fully
 # 'import onnx' inside of dynamo_export (by way of _assert_dependencies).
 if TYPE_CHECKING:
+    import onnxscript  # type: ignore[import]
     from onnxscript.function_libs.torch_lib import registration  # type: ignore[import]
 
 OpsetVersion = int
-_K = TypeVar("_K")
-_V = TypeVar("_V")
 
 
-class MergeDict(Generic[_K, _V], Collection[_K]):
-    """
-    A dictionary that merges built-in and custom symbolic functions.
+@dataclasses.dataclass(frozen=True, eq=True)
+class SymbolicFunction:
+    """A wrapper of onnx-script function.
 
-    It supports adding and removing built-in symbolic functions with custom ones.
-
-    Attributes:
-        _torchlib (Dict[_K, List[_V]]): A dictionary to hold built-in symbolic functions.
-        _customs (Dict[_K, List[_V]]): A dictionary to hold custom symbolic functions.
-        _merged (Dict[_K, List[_V]]): A dictionary that merges built-in and custom symbolic functions.
-    """
-
-    def __init__(self):
-        self._torchlib: Dict[_K, Set[_V]] = {}
-        self._merged: Dict[_K, Set[_V]] = {}
-        self._customs: Dict[_K, Set[_V]] = {}
-
-    def set_base(self, key: _K, value: _V) -> None:
-        self._torchlib.setdefault(key, set()).add(value)
-        if key not in self._customs:
-            self._merged.setdefault(key, set()).add(value)
-
-    def in_base(self, key: _K) -> bool:
-        """Checks if a key is in the base dictionary."""
-        return key in self._torchlib
-
-    def add_custom(self, key: _K, value: _V) -> None:
-        """Add a base key-value with a new pair."""
-        self._customs.setdefault(key, set()).add(value)
-        self._merged.setdefault(key, set()).add(value)
-
-    def remove_custom(self, key: _K) -> None:
-        """Remove a key-value pair."""
-        # FIXME(titaiwang): How to remove a specific function instead of whole overloads?
-        self._customs.pop(key, None)  # type: ignore[arg-type]
-        self._merged.pop(key, None)  # type: ignore[arg-type]
-        if key in self._torchlib:
-            self._merged[key] = self._torchlib[key]
-
-    def custom_added(self, key: _K) -> bool:
-        """Checks if a key-value pair is overridden."""
-        return key in self._customs
-
-    def __getitem__(self, key: _K) -> Set[_V]:
-        return self._merged[key]
-
-    def get(self, key: _K, default: Optional[Set[_V]] = None) -> Optional[Set[_V]]:
-        return self._merged.get(key, default)
-
-    def __contains__(self, key: object) -> bool:
-        return key in self._merged
-
-    def __iter__(self):
-        return iter(self._merged)
-
-    def __len__(self) -> int:
-        return len(self._merged)
-
-    def __repr__(self) -> str:
-        return f"MergeDict(torchlib={self._torchlib}, customs={self._customs})"
-
-    def __bool__(self) -> bool:
-        return bool(self._merged)
-
-
-class _SymbolicFunctionGroup:
-    """A group of overloaded functions registered to the same name.
-
-    This class stores a collection of overloaded functions that share the same name.
-    Each function is associated with a specific opset version, and multiple versions
-    of the same function can be registered to support different opset versions.
-
-    Attributes:
-        _name: The name of the function group.
-        _functions: A dictionary of functions, keyed by the opset version.
+    op_name: The qualified name of the function. In the form of 'domain::op'.
+    onnx_function: The symbolic function from torchlib.
+    is_custom: Whether the function is a custom function.
 
     """
 
-    def __init__(self, name: str) -> None:
-        self._name = name
-        # A dictionary of functions, keyed by the opset version.
-        self._functions: MergeDict[OpsetVersion, Callable] = MergeDict()
-
-    def __repr__(self) -> str:
-        return f"_SymbolicFunctionGroup({self._name}, registered={self._functions})"
-
-    def __getitem__(self, key: OpsetVersion) -> Set[Callable]:
-        result = self.get(key)
-        if result is None:
-            raise KeyError(key)
-        return result
-
-    def get(self, opset: OpsetVersion) -> Optional[Set[Callable]]:
-        """Find the most recent version of the overloaded functions."""
-        return self._functions.get(opset)
-
-    def add(self, func: Callable, opset: OpsetVersion) -> None:
-        """Adds a symbolic function.
-
-        Args:
-            func: The function to add.
-            opset: The opset version of the function to add.
-        """
-        # FIXME(titaiwang): Check if the "function" is ducplicated.
-        self._functions.set_base(opset, func)
-
-    def add_custom(self, func: Callable, opset: OpsetVersion) -> None:
-        """Adds a custom symbolic function.
-
-        Args:
-            func: The symbolic function to register.
-            opset: The corresponding opset version.
-        """
-        self._functions.add_custom(opset, func)
-
-    def remove_custom(self, opset: OpsetVersion) -> None:
-        """Removes a custom symbolic function.
-
-        Args:
-            opset: The opset version of the custom function to remove.
-        """
-        if not self._functions.custom_added(opset):
-            warnings.warn(
-                f"No custom function registered for '{self._name}' opset {opset}"
-            )
-            return
-        self._functions.remove_custom(opset)
-
-    def support_opset(self) -> Collection[OpsetVersion]:
-        """Returns a list of supported opset versions."""
-        return list(self._functions)
+    onnx_function: Union["onnxscript.OnnxFunction", "onnxscript.TracedOnnxFunction"]
+    op_name: str
+    is_custom: bool = False
 
 
 class OnnxRegistry:
     """Registry for ONNX functions.
 
-    The registry maintains a mapping from qualified names to symbolic functions,
-    which can be overloaded to support multiple opset versions. It is used to
-    register new symbolic functions and to dispatch calls to the appropriate function.
+    The registry maintains a mapping from qualified names to symbolic functions under a
+    fixed opset version. It supports registering custom onnx-script functions and for
+    dispatcher to dispatch calls to the appropriate function.
 
     Attributes:
-        _registry: A dictionary mapping qualified names to _SymbolicFunctionGroup objects.
+        _registry: A dictionary mapping qualified names to a set of SymbolicFunctions.
+
+    Public Methods:
+        register_custom_op: Registers a custom operator.
+        get_functions: Returns the set of SymbolicFunctions for the given op.
+        is_registered_op: Returns whether the given op is registered.
+        all_registered_ops: Returns the set of all registered op names.
+
+    Private Methods:
+        _register: Registers a SymbolicFunction to an operator.
+        _initiate_registry_from_torchlib: Populates the registry with ATen functions from torchlib.
+        _get_custom_functions: Returns the set of custom functions for the given name.
+
     """
 
     def __init__(self, opset_version: int = 18) -> None:
-        self._registry: Dict[str, _SymbolicFunctionGroup] = {}
+        self._registry: Dict[str, Set[SymbolicFunction]] = defaultdict(set)
         # FIXME: Avoid importing onnxscript into torch
         from onnxscript.function_libs.torch_lib import (  # type: ignore[import]  # noqa: F401
             ops,  # TODO(titaiwang): get rid of this import
@@ -192,83 +77,92 @@ class OnnxRegistry:
             torchlib_registry: The torchlib registry to use for populating the registry.
         """
         for aten_name, aten_overloads_func in torchlib_registry.items():
-            for func in aten_overloads_func.overloads:
-                self.register(
-                    aten_name,
-                    self._opset_version,
-                    func,
-                    custom=False,
+            for overload_func in aten_overloads_func.overloads:
+                symbolic_function = SymbolicFunction(
+                    onnx_function=overload_func, op_name=aten_name, is_custom=False
                 )
+                self._register(symbolic_function)
 
     @_beartype.beartype
-    def register(
-        self, name: str, opset: OpsetVersion, func: Callable, custom: bool = True
-    ) -> None:
-        """Registers overloaded functions to an ATen operator (overload).
+    def _register(self, symbolic_function: SymbolicFunction) -> None:
+        """Registers a SymbolicFunction to an operator.
 
         Args:
-            name: The qualified name of the function to register. In the form of 'domain::op'.
+            symbolic_function: The SymbolicFunction to register.
+        """
+        self._registry[symbolic_function.op_name].add(symbolic_function)
+
+    @_beartype.beartype
+    def register_custom_op(
+        self,
+        op_name: str,
+        function: Union["onnxscript.OnnxFunction", "onnxscript.TracedOnnxFunction"],
+    ) -> None:
+        """Registers a custom operator.
+
+        Args:
+            op_name: The qualified name of the operator to register. In the form of 'domain::op'.
                 E.g. 'aten::add' or 'aten::pow.int'.
-            opset: The opset version of the function to register.
-            func: The symbolic function to register.
-            custom: Whether the function is a custom function that overrides existing ones.
+            function: The onnx-sctip function to register.
 
         Raises:
-            ValueError: If the separator '::' is not in the name.
+            ValueError: If the name is not in the form of 'domain::op'.
         """
-        if "::" not in name:
+        if "::" not in op_name:
             raise ValueError(
-                f"The name must be in the form of 'domain::op', not '{name}'"
+                f"The name must be in the form of 'domain::op', not '{op_name}'"
             )
-        symbolic_functions = self._registry.setdefault(
-            name, _SymbolicFunctionGroup(name)
+        symbolic_function = SymbolicFunction(
+            onnx_function=function, op_name=op_name, is_custom=True
         )
-        if custom:
-            symbolic_functions.add_custom(func, opset)
-        else:
-            symbolic_functions.add(func, opset)
+        self._register(symbolic_function)
 
     @_beartype.beartype
-    def unregister(self, name: str, opset: OpsetVersion) -> None:
-        """Unregisters overloaded functions to an ATen operator (overload).
+    def get_functions(self, name: str) -> Optional[Set[SymbolicFunction]]:
+        """Returns the set of SymbolicFunctions for the given op.
 
         Args:
-            name: The qualified name of the function to unregister.
-            opset: The opset version of the function to unregister.
-        """
-        if name not in self._registry:
-            return
-        self._registry[name].remove_custom(opset)
-
-    @_beartype.beartype
-    def get_function_group(self, name: str) -> Optional[_SymbolicFunctionGroup]:
-        """Returns the _SymbolicFunctionGroup object for the given name.
-
-        Args:
-            name: The qualified name of the function group to retrieve.
+            name: The qualified op name of the functions to retrieve.
 
         Returns:
-            The _SymbolicFunctionGroup object corresponding to the given name, or None if the name is not in the registry.
+            Thethe set of SymbolicFunctions corresponding to the given name, or None if
+            the name is not in the registry.
         """
-        return self._registry.get(name)
+        if (functions := self._registry.get(name)) is not None:
+            return functions
+        return None
 
     @_beartype.beartype
-    def is_registered_op(self, name: str, version: int) -> bool:
-        """Returns whether the given op is registered for the given opset version.
+    def _get_custom_functions(self, op_name: str) -> Optional[Set[SymbolicFunction]]:
+        """Returns the set of custom functions for the given name.
 
         Args:
-            name: The qualified name of the function to check.
-            version: The opset version to check.
+            op_name: The qualified op name of the functions to retrieve.
 
         Returns:
-            True if the given op is registered for the given opset version, otherwise False.
+            The set of custom SymbolicFunctions corresponding to the given name, or None
+            if the name is not in the registry.
         """
-        functions = self.get_function_group(name)
-        if functions is None:
-            return False
-        return functions.get(version) is not None
+        if (functions := self.get_functions(op_name)) is not None:
+            custom_functions = {func for func in functions if func.is_custom}
+            if custom_functions:
+                return custom_functions
+        return None
 
     @_beartype.beartype
-    def all_functions(self) -> Set[str]:
+    def is_registered_op(self, op_name: str) -> bool:
+        """Returns whether the given op is registered.
+
+        Args:
+            op_name: The qualified op name of the function to check.
+
+        Returns:
+            True if the given op is registered, otherwise False.
+        """
+        functions = self.get_functions(op_name)
+        return functions is not None
+
+    @_beartype.beartype
+    def all_registered_ops(self) -> Set[str]:
         """Returns the set of all registered function names."""
         return set(self._registry)

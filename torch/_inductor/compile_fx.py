@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import functools
 import itertools
@@ -230,6 +231,34 @@ def inner_compile_with_cpp_wrapper(inner_compile):
     return wrapper
 
 
+def fake_tensor_prop(
+    gm: torch.fx.GraphModule,
+    example_inputs: List[torch.Tensor],
+    force_allow_non_fake_inputs=False,
+):
+    """
+    If we can not detect fake mode from the context of inputs, create one.
+
+    The created fake mode will be returned.
+    """
+    fake_mode = detect_fake_mode(example_inputs)
+    if not fake_mode:
+        fake_mode = torch._subclasses.FakeTensorMode(allow_non_fake_inputs=True)
+        FakeTensorProp(gm, mode=fake_mode).propagate(*example_inputs)
+    else:
+        ctx = (
+            contextlib.nullcontext()
+            if not force_allow_non_fake_inputs
+            else unittest.mock.patch.object(fake_mode, "allow_non_fake_inputs", True)
+        )
+        with ctx:
+            FakeTensorProp(gm, mode=fake_mode).propagate_dont_convert_inputs(
+                *example_inputs
+            )
+
+    return fake_mode
+
+
 @DebugContext.wrap
 @torch.utils._python_dispatch._disable_current_modes()
 @time_and_log(attr="compilation time (in seconds)")
@@ -245,6 +274,7 @@ def compile_fx_inner(
     is_inference=False,
     boxed_forward_device_index=None,
     user_visible_outputs=frozenset(),
+    layout_opt=None,
 ):
     if dynamo_utils.count_calls(gm.graph) == 0:
         return make_boxed_func(gm.forward)
@@ -263,6 +293,7 @@ def compile_fx_inner(
         "aot_mode": aot_mode,
         "is_inference": is_inference,
         "user_visible_outputs": user_visible_outputs,
+        "layout_opt": layout_opt,
     }
 
     compiled_graph: CompiledFxGraph = fx_codegen_and_compile(
@@ -395,6 +426,7 @@ def fx_codegen_and_compile(
     aot_mode=False,
     is_inference=False,
     user_visible_outputs=frozenset(),
+    layout_opt=None,
 ):
     if is_tf32_warning_applicable(gm):
         _warn_tf32_disabled()
@@ -431,14 +463,8 @@ def fx_codegen_and_compile(
     # .view() call.
     view_to_reshape(gm)
 
-    fake_mode = detect_fake_mode(example_inputs)
-    if not fake_mode:
-        fake_mode = torch._subclasses.FakeTensorMode(allow_non_fake_inputs=True)
-        FakeTensorProp(gm, mode=fake_mode).propagate(*example_inputs)
-    else:
-        FakeTensorProp(gm, mode=fake_mode).propagate_dont_convert_inputs(
-            *example_inputs
-        )
+    fake_mode = fake_tensor_prop(gm, example_inputs)
+
     # pattern matcher passes might not preserve striding information
     # on node.meta["val"]. if in the future we rely on these being
     # correct we will need to fix.
@@ -729,10 +755,16 @@ def fw_compiler_freezing(
     graph_id,
     forward_device,
 ):
-    from torch._inductor.freezing import freeze
+    from torch._inductor.freezing import convert_conv_weights_to_channels_last, freeze
 
     # partition_fn won't be called
     joint_graph_passes(aot_autograd_model)
+
+    layout_opt = GraphLowering.decide_layout_opt(aot_autograd_model)
+    if layout_opt:
+        # make sure meta['val'] is properly setup
+        fake_tensor_prop(aot_autograd_model, aot_example_inputs, True)
+        convert_conv_weights_to_channels_last(aot_autograd_model)
 
     opt_model, preserved_arg_indices = freeze(
         dynamo_model,
@@ -745,6 +777,11 @@ def fw_compiler_freezing(
 
     fake_mode = detect_fake_mode(aot_example_inputs)
 
+    # for freezing, all graph outputs should be user visible
+    *_, model_outputs_node = opt_model.graph.nodes
+    model_outputs, _ = pytree.tree_flatten(model_outputs_node.args)
+    user_visible_outputs = [n.name for n in model_outputs]
+
     # constant params will be real tensors, not fake
     with unittest.mock.patch.object(fake_mode, "allow_non_fake_inputs", True):
         optimized_function = inner_compile(
@@ -755,6 +792,8 @@ def fw_compiler_freezing(
             graph_id=graph_id,
             is_inference=True,
             boxed_forward_device_index=forward_device,
+            layout_opt=layout_opt,
+            user_visible_outputs=user_visible_outputs,
         )
 
     # Need to drop the args we have constant-ified.
@@ -877,12 +916,8 @@ def compile_fx(
                     orig_model_outputs_node.args
                 )
                 num_orig_model_outputs = len(orig_model_outputs)
-                original_output_start_index = model.meta.get(
-                    "original_output_start_index", 0
-                )
             else:
                 num_orig_model_outputs = num_model_outputs
-                original_output_start_index = 0
 
             assert num_orig_model_outputs <= num_model_outputs
 

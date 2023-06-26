@@ -4,7 +4,11 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.utils._pytree as pytree
+from torch._dynamo.utils import dynamo_timed
 from . import config
+
+aten = torch.ops.aten
+prims = torch.ops.prims
 
 
 def replace_node_with_constant(gm, node, constant):
@@ -241,3 +245,60 @@ def discard_traced_gm_params(mod):
             e_t.requires_grad_(True)
             e_t._is_param = True
         setattr(mod, attr_name, e_t)
+
+
+def enforce_output_layout(gm):
+    """
+    Make sure the output node's layout does not change due to compiler optimizations
+    by adding aten.as_strided nodes with the expected strides.
+
+    Only used for inference so we can assume all graph outputs are model outputs.
+    """
+    *_, output_node = gm.graph.nodes
+    out_list, spec = pytree.tree_flatten(output_node.args)
+    with gm.graph.inserting_before(output_node):
+        for n in out_list:
+            if not isinstance(
+                n.meta["val"], torch.Tensor
+            ) or not torch._prims_common.is_non_overlapping_and_dense(n.meta["val"]):
+                continue
+
+            # add a node to enforce eager layout
+            ft = n.meta["val"]
+            new_node = gm.graph.call_function(
+                prims.inductor_force_stride.default, (n, ft.stride())
+            )
+
+            # can not call
+            # n.replace_all_uses_with(new_node)
+            # since it will replace the usage of n in new_node itself.
+            output_node.replace_input_with(n, new_node)
+
+    gm.graph.lint()
+    gm.recompile()
+
+
+@dynamo_timed
+def convert_conv_weights_to_channels_last(gm):
+    """
+    Convert 4d convolution weight tensor to channels last format.
+
+    This pass is performed before freezing so the added nodes can be constant
+    foled by freezing.
+    """
+    convs = [n for n in gm.graph.nodes if n.target == aten.convolution.default]
+    for conv in convs:
+        weight_node = conv.args[1]
+        if len(weight_node.meta["val"].size()) != 4:
+            # not a 4d tensor, skip
+            continue
+
+        with gm.graph.inserting_before(conv):
+            new_node = gm.graph.call_function(
+                aten.clone.default,
+                (weight_node,),
+                {"memory_format": torch.channels_last},
+            )
+            conv.replace_input_with(weight_node, new_node)
+
+    enforce_output_layout(gm)

@@ -27,6 +27,7 @@ from torch.testing._internal.common_dtype import (
     floating_and_complex_types_and, integral_types, floating_types_and,
 )
 from torch.testing._internal.opinfo.definitions.sparse import validate_sample_input_sparse
+from torch._inductor.utils import has_triton
 
 
 def _op_supports_any_sparse(op):
@@ -4889,6 +4890,53 @@ class TestSparseAny(TestCase):
             n = 2 ** n * 32
             k = 2 ** k * 128
             run_test(batch_shape, m, n, k, device, dtype, dtype_out[dtype], add_bias, activation, rtol, atol)
+
+    @unittest.skipIf(not has_triton(), "Test needs triton and recent GPU arch")
+    @dtypes(torch.int8, torch.half, torch.bfloat16)
+    def test_semi_structured_sparse_conversions(self, device, dtype):
+        from torch.sparse.semi_structured_sparse_conversions import (
+            semi_structured_sparse_compress_2by4,
+            semi_structured_sparse_uncompress_2by4
+        )
+
+        def make_tensor(shape, dtype):
+            if dtype.is_complex:
+                return torch.zeros(shape, dtype=dtype)
+            elif dtype.is_floating_point:
+                x = torch.randn(shape, dtype=dtype) / 10
+                x[x == 0] = 1
+                return x
+            else:
+                x = torch.randint(-5, 5, shape, dtype=dtype)
+                x[x == 0] = 1
+                return x
+
+        def random_mask_choice():
+            choices = [
+                [1, 1, 0, 0],
+                [1, 0, 1, 0],
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+                [0, 1, 0, 1],
+                [0, 0, 1, 1]
+            ]
+            i = random.randint(0, len(choices) - 1)
+            return choices[i]
+
+        def run_test(m, k, device, dtype):
+            mask_entries = [random_mask_choice() for i in range(m * (k // 4))]
+            mask = torch.tensor(mask_entries, dtype=torch.bool).view(m, k)
+            dense_ref = make_tensor((m, k), dtype).masked_fill(~mask, 0).to(device)
+
+            sparse, meta = semi_structured_sparse_compress_2by4(dense_ref)
+            dense = semi_structured_sparse_uncompress_2by4(sparse, meta)
+
+            torch.testing.assert_close(dense, dense_ref, rtol=0, atol=0)
+
+        for (m, k) in itertools.product(range(4), range(4)):
+            m = (m + 1) * 32
+            k = (k + 1) * 128
+            run_test(m, k, device, dtype)
 
     @onlyCPU
     @all_sparse_layouts('layout', include_strided=True)

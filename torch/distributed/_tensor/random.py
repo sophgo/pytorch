@@ -70,7 +70,9 @@ def manual_seed(seed: int, device_mesh: DeviceMesh, tp_dim: int = 0) -> None:
 
     # the current rank is in mesh
     if device_mesh.get_coordinate() is not None:
-        if isinstance(_rng_tracker, OffsetBasedRNGTracker):
+        if isinstance(_rng_tracker, TensorParallelRNGTracker):
+            _rng_tracker._manual_seed(device_mesh, seed, tp_dim)
+        elif isinstance(_rng_tracker, OffsetBasedRNGTracker):
             _rng_tracker._manual_seed(seed)
         else:
             raise RuntimeError(
@@ -297,3 +299,43 @@ class OffsetBasedRNGTracker(CudaRNGStateTracker):
             shard_coord_stride *= size
 
         return shard_linear_idx
+
+
+class TensorParallelRNGTracker(CudaRNGStateTracker):
+    def __init__(self):
+        super().__init__()
+        # copy the default RNG state
+        self.rng_states["tensor-parallel-rng"] = torch.cuda.get_rng_state()
+
+    def _manual_seed(
+        self,
+        device_mesh: DeviceMesh,
+        base_seed: int = 1234,
+        tp_dim: int = 0,
+    ):
+        coordinate = device_mesh.get_coordinate()
+        assert coordinate is not None
+        tensor_parallel_rank = coordinate[tp_dim]
+        # this magic number 2718 comes from Megatron's code
+        # (https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tensor_parallel/random.py)
+        tensor_parallel_seed = base_seed + 2718 + tensor_parallel_rank
+        self.set_seed("tensor-parallel-rng", tensor_parallel_seed)
+
+    @contextlib.contextmanager
+    def _distribute_region(self, spec: DTensorSpec):
+        # check if the tensor parallel rng state has been synchronized or not
+        if not self.rng_state_is_sync("tensor-parallel-rng"):
+            raise RuntimeError(
+                "TensorParallelRNGTracker requires the random state to be synchronized "
+                "before entering into a distribute region!"
+            )
+
+        if self.distribute_region_enabled:
+            with torch.random.fork_rng(self._devices):
+                torch.cuda.set_rng_state(self.rng_states["tensor-parallel-rng"])
+                try:
+                    yield
+                finally:
+                    self.rng_states["tensor-parallel-rng"] = torch.cuda.get_rng_state()
+        else:
+            yield

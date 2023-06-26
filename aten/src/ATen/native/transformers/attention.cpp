@@ -9,7 +9,8 @@
 #include <ATen/TensorIndexing.h>
 #include <ATen/cpu/vec/vec256/vec256.h>
 #include <ATen/native/transformers/attention.h>
-#include <ATen/native/transformers/sdp_utils_cpp.h>
+#include <ATen/native/transformers/cpu/attention.h>
+#include <ATen/native/transformers/sdp_utils.h>
 #include <type_traits>
 #include <utility>
 #include <c10/core/SymIntArrayRef.h>

@@ -5,7 +5,6 @@ import sympy
 from typing import Any, Dict, List, Optional, Tuple, Union
 from torch._functorch.aot_autograd import FQN, GraphInputName, GraphOutputName
 
-
 import torch
 from torch.fx.passes.infra.pass_manager import PassManager
 import torch.fx._pytree as fx_pytree
@@ -13,12 +12,13 @@ import torch.utils._pytree as pytree
 from torch.fx.experimental.symbolic_shapes import SymInt
 from torch._subclasses.fake_tensor import FakeTensor
 from . import error
-from .pass_base import PassType
+from .pass_base import PassType, ExportPassBase
 from .passes.add_runtime_assertions_for_constraints_pass import (
     _AddRuntimeAssertionsForConstraintsPass,
     InputDim,
     RangeConstraint,
 )
+from .passes.functionalize_side_effectful_ops_pass import _FunctionalizeSideEffectfulOpsPass
 
 
 __all__ = ["ExportedProgram"]
@@ -67,6 +67,21 @@ class ExportGraphSignature:
     buffers_to_mutate: Dict[GraphOutputName, FQN]
 
     backward_signature: Optional[ExportBackwardSignature]
+    # Map from assertion dependency token index to assertion dep token output
+    # name in output. The shape of output after aot_autograd will be like:
+    # (updated_inputs, user_outputs, dep_token).
+    assertion_dep_token: Optional[Dict[int, str]] = None
+
+    def __post_init__(self) -> None:
+        assertion_dep_token = self.assertion_dep_token
+        if assertion_dep_token is None:
+            return
+        assert len(assertion_dep_token) == 1
+        assertion_dep_token_index = list(assertion_dep_token.keys())[0]
+        assert (
+            len(self.user_outputs) + len(self.buffers_to_mutate)
+            == assertion_dep_token_index
+        )
 
 
 class ExportedProgram:
@@ -116,6 +131,13 @@ class ExportedProgram:
             mutation = self.graph_signature.buffers_to_mutate
             num_mutated = len(mutation)
             mutated_buffers = res[:num_mutated]
+
+            # Exclude dependency token from final result.
+            assertion_dep_token = self.graph_signature.assertion_dep_token
+            if assertion_dep_token is not None:
+                assertion_dep_token_index = list(assertion_dep_token.keys())[0]
+                res = res[:assertion_dep_token_index]
+
             res = res[num_mutated:]
             try:
                 res = pytree.tree_unflatten(res, self.call_spec.out_spec)
@@ -166,10 +188,52 @@ class ExportedProgram:
         transformed_ep.graph_module.meta.update(res.graph_module.meta)
         return transformed_ep
 
-    def _add_runtime_assertions(self) -> "ExportedProgram":
-        return self.transform(
-            _AddRuntimeAssertionsForConstraintsPass(self.range_constraints, self.equality_constraints)
+    def _add_runtime_assertions(
+        self,
+        functionalize_assertions: bool,
+    ) -> "ExportedProgram":
+        p = _AddRuntimeAssertionsForConstraintsPass(
+            self.range_constraints,
+            self.equality_constraints,
         )
+        ep = _update_graph_signature(old_ep=self, new_ep=self.transform(p), p=p)
+        if functionalize_assertions:
+            p = _FunctionalizeSideEffectfulOpsPass()
+            ep = _update_graph_signature(old_ep=ep, new_ep=ep.transform(p), p=p)
+
+        return ep
+
+def _update_graph_signature(
+    old_ep: ExportedProgram, new_ep: ExportedProgram, p: ExportPassBase,
+) -> ExportedProgram:
+    """
+    Update graph signature of exported program after pass.
+
+    Args:
+        old_ep: Exported program before pass.
+        new_ep: Exported program after pass.
+        p: The pass.
+
+    Returns: A new exported program copied from **`new_ep`** with graph
+        signature updated.
+    """
+
+    # TODO: Extend current pass infra to make it update graph signature specific
+    # to each pass immediately after each pass run.
+    gs = p.update_exported_program_signature(old_ep=old_ep, new_ep=new_ep)
+    if gs is None:
+        return new_ep
+
+    gm = copy.deepcopy(new_ep.graph_module)
+    return ExportedProgram(
+        root=gm,
+        graph=gm.graph,
+        graph_signature=gs,
+        call_spec=copy.deepcopy(new_ep.call_spec),
+        state_dict=new_ep.state_dict,
+        range_constraints=copy.deepcopy(new_ep.range_constraints),
+        equality_constraints=copy.deepcopy(new_ep.equality_constraints),
+    )
 
 
 def _process_constraints(

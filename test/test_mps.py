@@ -61,9 +61,6 @@ _ref_test_ops = tuple(
 
 def mps_ops_grad_modifier(ops):
     XFAILLIST_GRAD = {
-        # CPU Error: RuntimeError: "addmv_impl_cpu" not implemented for 'Half'
-        'addr': [torch.float16],
-
         # Unimplemented ops
         '__getitem__': [torch.float16],
         'prod': [torch.float32],  # The operator 'aten::cumprod.out'
@@ -10426,6 +10423,8 @@ class TestConsistency(TestCaseMPS):
         'nn.functional.triplet_margin_loss',
         'nn.functional.triplet_margin_with_distance_loss',
         'round', 'xlogy', 'addcmul',
+        '__rmatmul__', 'addbmm', 'addmv', 'baddbmm',
+        'cov', 'matmul',
 
         # for macOS 12
         'masked.normalize', 'masked.sum', 'masked.var',

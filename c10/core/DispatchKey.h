@@ -22,8 +22,10 @@ namespace c10 {
 // use.
 
 // WARNING!  If you add a new backend component to the end of this list,
-// make sure you update PrivateUse3Bit.  (But you shouldn't: private use
-// keys should have higher precedence than all built-in keys)
+// make sure you register it before Meta.
+// Meta must be at the end so that meta key in tls triggers meta kernels.
+// (But you shouldn't: private use keys should have higher precedence than all
+// built-in keys)
 
 // If you add a new (non-privateuse) backend here,
 // make sure to add an Autograd<Backend> fallthrough kernel
@@ -40,10 +42,10 @@ namespace c10 {
   _(HPU, extra)                                 \
   _(VE, extra)                                  \
   _(Lazy, extra)                                \
-  _(Meta, extra)                                \
   _(MTIA, extra)                                \
   _(PrivateUse1, extra)                         \
   _(PrivateUse2, extra)                         \
+  _(Meta, extra)                                \
   _(PrivateUse3, extra)
 
 // WARNING!  If we add a new per-backend functionality key that has higher
